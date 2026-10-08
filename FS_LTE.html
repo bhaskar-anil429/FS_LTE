@@ -192,6 +192,20 @@
 </div>
 
 <div class="panel">
+  <h2>Firmware update (LTE / OTA)</h2>
+  <div class="row"><label for="otaUrl">Image URL (plain http)</label>
+    <input type="text" id="otaUrl" maxlength="199"
+           placeholder="http://your-server/firmware.bin"></div>
+  <div class="row">
+    <button id="btnOta" disabled>Arm OTA update</button>
+  </div>
+  <div class="row"><span id="otaState" class="pemstate">Sends {"cmd":"ota_ready","url":…} — the same command as the
+  MQTT CMD topic. The device downloads the image over LTE at the end of its next publish cycle, then reboots
+  into it. Use plain http (the modem won't follow https redirects). The same URL is allowed 3 attempts per
+  device; after that, change the URL.</span></div>
+</div>
+
+<div class="panel">
   <h2>Log</h2>
   <div id="log"></div>
 </div>
@@ -308,7 +322,7 @@ function setConnected(on) {
   $('status').textContent = on ? (dev?.name || 'connected') : 'disconnected';
   $('status').className = on ? 'on' : 'off';
   if (on) { $('troublePanel').hidden = true; }
-  for (const id of ['btnNet', 'btnDev', 'btnCerts', 'btnFw', 'btnFwSlots', 'btnFwConfirm']) $(id).disabled = !on;
+  for (const id of ['btnNet', 'btnDev', 'btnCerts', 'btnFw', 'btnFwSlots', 'btnFwConfirm', 'btnOta']) $(id).disabled = !on;
   if (!on) { chSmp = null; smpRx = null; smpPending = null; }
   $('btnDisconnect').disabled = !on;
   $('btnRefresh').disabled = !on;
@@ -801,6 +815,25 @@ $('btnDisconnect').onclick = () => { wantReconnect = false; dev?.gatt?.disconnec
 $('btnPemClear').onclick = async () => {
   try { await expectOk({ cmd: 'pem_clear' }, 'pem_clear'); log('PEM overrides cleared - embedded certs active', 'sys'); await refreshInfo(); }
   catch (e) { log(e.message, 'err'); }
+};
+$('btnOta').onclick = async () => {
+  const url = $('otaUrl').value.trim();
+  /* Mirrors the firmware's checks in cmd.c (http prefix, < 200 chars). */
+  if (!url.startsWith('http') || url.length >= 200) {
+    log('OTA: URL must start with http and be under 200 characters', 'err');
+    return;
+  }
+  if (url.startsWith('https')) log('OTA: https URL — the modem may fail the download; plain http is preferred', 'sys');
+  try {
+    const r = await sendCmd({ cmd: 'ota_ready', url });
+    if (r && r.resp === 0) {
+      $('otaState').textContent = 'Armed. The device downloads at the end of its next publish cycle, then reboots — watch the serial console.';
+      log('OTA armed: ' + url, 'sys');
+    } else {
+      $('otaState').textContent = 'Refused: ' + JSON.stringify(r) + ' — this URL has used its 3 attempts on this device (or was already installed). Use a different URL.';
+      log('OTA refused: ' + JSON.stringify(r), 'err');
+    }
+  } catch (e) { log('OTA: ' + e.message, 'err'); }
 };
 $('btnRefresh').onclick = () => refreshInfo().catch(e => log(e.message, 'err'));
 $('btnNet').onclick = () => gatt('applying network settings', 30000, applyNet).catch(() => {});
