@@ -552,29 +552,62 @@ function cborEnc(v) {
 }
 
 function cborDec(buf) {
+  /* Handles the indefinite-length maps/arrays/strings (0x9f/0xbf/0x5f/0x7f
+   * ... 0xff) that the device's zcbor encoder emits. The old decoder read
+   * those as a ~2^64 length and spun forever, hanging the tab at 100% CPU
+   * on the first SMP reply (2026-10-08) — the PC tool's ciborium was fine.
+   * Every read is bounds-checked: bad input throws, never loops. */
   let p = 0;
   const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
+  const BRK = Symbol('break');
+  const byte = () => { if (p >= u8.length) throw new Error('CBOR: truncated'); return u8[p++]; };
   const arg = (ib) => {
     const n = ib & 0x1f;
     if (n < 24) return n;
-    if (n === 24) return u8[p++];
-    if (n === 25) { const v = (u8[p] << 8) | u8[p + 1]; p += 2; return v; }
-    if (n === 26) { const v = (u8[p] * 0x1000000) + (u8[p + 1] << 16) + (u8[p + 2] << 8) + u8[p + 3]; p += 4; return v; }
-    let v = 0; for (let i = 0; i < 8; i++) v = v * 256 + u8[p++]; return v;
+    if (n === 24) return byte();
+    if (n === 25) return (byte() << 8) | byte();
+    if (n === 26) return ((byte() * 0x1000000) + (byte() << 16) + (byte() << 8) + byte());
+    if (n === 27) { let v = 0; for (let i = 0; i < 8; i++) v = v * 256 + byte(); return v; }
+    if (n === 31) return -1;                  /* indefinite length */
+    throw new Error('CBOR: bad length');
   };
+  const bytesOf = (n) => { if (p + n > u8.length) throw new Error('CBOR: truncated'); const v = u8.slice(p, p + n); p += n; return v; };
   const one = () => {
-    const ib = u8[p++], major = ib >> 5;
+    const ib = byte(), major = ib >> 5;
+    if (ib === 0xff) return BRK;
     if (major === 0) return arg(ib);
     if (major === 1) return -1 - arg(ib);
-    if (major === 2) { const n = arg(ib); const v = u8.slice(p, p + n); p += n; return v; }
-    if (major === 3) { const n = arg(ib); const v = dec.decode(u8.slice(p, p + n)); p += n; return v; }
-    if (major === 4) { const n = arg(ib); const a = []; for (let i = 0; i < n; i++) a.push(one()); return a; }
-    if (major === 5) { const n = arg(ib); const m = {}; for (let i = 0; i < n; i++) { const k = one(); m[k] = one(); } return m; }
+    if (major === 2 || major === 3) {
+      const n = arg(ib);
+      let v;
+      if (n >= 0) v = bytesOf(n);
+      else {                                  /* chunked string */
+        const parts = []; let c;
+        while ((c = one()) !== BRK) parts.push(typeof c === 'string' ? enc.encode(c) : c);
+        v = new Uint8Array(parts.reduce((a, x) => a + x.length, 0));
+        let o = 0; for (const x of parts) { v.set(x, o); o += x.length; }
+      }
+      return major === 3 ? dec.decode(v) : v;
+    }
+    if (major === 4) {
+      const n = arg(ib), a = [];
+      if (n >= 0) { for (let i = 0; i < n; i++) a.push(one()); }
+      else { let x; while ((x = one()) !== BRK) a.push(x); }
+      return a;
+    }
+    if (major === 5) {
+      const n = arg(ib), m = {};
+      if (n >= 0) { for (let i = 0; i < n; i++) { const k = one(); m[k] = one(); } }
+      else { let k; while ((k = one()) !== BRK) m[k] = one(); }
+      return m;
+    }
+    if (major === 6) { arg(ib); return one(); }   /* tag: ignore, keep value */
     const n = ib & 0x1f;                      /* major 7: simple/float */
     if (n === 20) return false; if (n === 21) return true;
     if (n === 22 || n === 23) return null;
-    if (n === 25) { p += 2; return 0; } if (n === 26) { p += 4; return 0; }
-    if (n === 27) { p += 8; return 0; }
+    if (n === 24) { byte(); return null; }
+    if (n === 25) { bytesOf(2); return 0; } if (n === 26) { bytesOf(4); return 0; }
+    if (n === 27) { bytesOf(8); return 0; }
     return null;
   };
   return one();
@@ -588,7 +621,7 @@ async function smpAttach() {
   chSmp = await svc.getCharacteristic(SMP_CHR);
   await chSmp.startNotifications();
   chSmp.addEventListener('characteristicvaluechanged', (ev) => {
-    const b = new Uint8Array(ev.target.value.buffer);
+    const b = new Uint8Array(ev.target.value.buffer, ev.target.value.byteOffset, ev.target.value.byteLength);
     smpRx = smpRx ? new Uint8Array([...smpRx, ...b]) : b;
     if (smpRx.length < 8) return;
     const need = 8 + ((smpRx[2] << 8) | smpRx[3]);
@@ -596,6 +629,34 @@ async function smpAttach() {
     const frame = smpRx; smpRx = null;
     if (smpPending) { const r = smpPending; smpPending = null; r(frame); }
   });
+}
+
+function smpFrame(op, group, id, payload) {
+  const body = cborEnc(payload ?? {});
+  const f = new Uint8Array(8 + body.length);
+  f[0] = op; f[1] = 0; f[2] = body.length >> 8; f[3] = body.length & 0xff;
+  f[4] = group >> 8; f[5] = group & 0xff; f[6] = (smpSeq++) & 0xff; f[7] = id;
+  f.set(body, 8);
+  return f;
+}
+
+/* One SMP frame may span several GATT writes: send it as 180-byte
+ * write-without-response slices (each fits any ATT MTU; the SMP
+ * characteristic supports no other write type) and let the device
+ * reassemble (MCUMGR_TRANSPORT_BT_REASSEMBLY=y), as the native PC tool
+ * does. No pacing: the 2026-10-08 "renderer freeze" blamed on write bursts
+ * was really cborDec spinning on indefinite-length replies. If Chrome's
+ * write queue is momentarily full the write rejects — back off and retry. */
+async function smpWrite(f) {
+  for (let i = 0; i < f.length; i += 180) {
+    for (let tries = 0; ; tries++) {
+      try { await chSmp.writeValueWithoutResponse(f.subarray(i, i + 180)); break; }
+      catch (e) {
+        if (tries >= 20) throw e;
+        await new Promise(res => setTimeout(res, 20));
+      }
+    }
+  }
 }
 
 async function smpRequest(op, group, id, payload, timeoutMs) {
@@ -608,11 +669,7 @@ async function smpRequest(op, group, id, payload, timeoutMs) {
 
   const work = (async () => {
     await smpAttach();
-    const body = cborEnc(payload ?? {});
-    const f = new Uint8Array(8 + body.length);
-    f[0] = op; f[1] = 0; f[2] = body.length >> 8; f[3] = body.length & 0xff;
-    f[4] = group >> 8; f[5] = group & 0xff; f[6] = (smpSeq++) & 0xff; f[7] = id;
-    f.set(body, 8);
+    const f = smpFrame(op, group, id, payload);
     const resp = new Promise((resolve, reject) => {
       smpPending = (frame) => {
         const r = cborDec(frame.subarray(8));
@@ -620,8 +677,7 @@ async function smpRequest(op, group, id, payload, timeoutMs) {
         else resolve(r);
       };
     });
-    try { await chSmp.writeValueWithoutResponse(f); }
-    catch (_) { await chSmp.writeValueWithResponse(f); }
+    await smpWrite(f);
     return resp;
   })();
 
@@ -655,44 +711,63 @@ async function fwUpload() {
   $('btnFw').disabled = true;
   $('fwProg').hidden = false; $('fwProg').value = 0;
   try {
-    const sha = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
     log(`uploading ${file.name} (${bytes.length} B) ...`, 'sys');
-    let off = 0;
+    let off = 0, frames = 0, nextPct = 2;
     const t0 = Date.now();
     while (off < bytes.length) {
-      const first = (off === 0);
-      /* Web Bluetooth gives no MTU API; a write larger than ATT_MTU-3
-       * (~240 B here) never leaves the browser. First frame carries
-       * len+sha overhead (~96 B), later frames ~30 B. */
-      const n = Math.min(first ? 140 : 200, bytes.length - off);
-      const payload = first
-        ? { image: 0, len: bytes.length, off: 0, sha, data: bytes.subarray(0, n) }
-        : { off, data: bytes.subarray(off, off + n) };
-      const r = await smpRequest(2, 1, 1, payload, 15000);
+      /* Big frames like the PC tool: ~2.4 KB of image per SMP request, sent
+       * as 180-byte GATT slices and reassembled on the device. Largest frame
+       * 2426 B incl. header/CBOR, under the 2475 B device netbuf. The old
+       * ~150 B frames could not finish inside the 180 s config window. */
+      const n = Math.min(off === 0 ? 2300 : 2400, bytes.length - off);
+      const payload = off === 0
+        ? { data: bytes.subarray(0, n), off: 0, len: bytes.length }
+        : { data: bytes.subarray(off, off + n), off };
+      let r;
+      try {
+        r = await smpRequest(2, 1, 1, payload, 15000);
+      } catch (e) {
+        throw new Error(`no reply to the frame at offset ${off} of ${bytes.length} ` +
+                        `after ${((Date.now() - t0) / 1000).toFixed(0)} s (${e.message})`);
+      }
       const newOff = (r && typeof r.off === 'number') ? r.off : off + n;
       if (newOff <= off) throw new Error(`no progress at offset ${off}`);
       off = newOff;
-      /* pace writes — rapid write-without-response floods can freeze the
-       * renderer on macOS Chrome (observed live 2026-08-30) */
-      await new Promise(res => setTimeout(res, 8));
+      frames++;
       $('fwProg').value = Math.round(100 * off / bytes.length);
-      if (off % 35000 < 200) {
-        log(`  upload ${Math.round(100 * off / bytes.length)}% (${off} B)`, 'sys');
-        /* macrotask yield: let Chrome paint + service its BLE queue */
-        await new Promise(res => setTimeout(res, 0));
+      /* Progress every 2 %, with speed and ETA, so a stall is obvious. */
+      const pct = Math.floor(100 * off / bytes.length);
+      if (pct >= nextPct || off >= bytes.length) {
+        const secs = (Date.now() - t0) / 1000;
+        const rate = off / Math.max(secs, 0.001);
+        log(`  upload ${pct}% (${off} B) — ${secs.toFixed(0)} s, ` +
+            `${(rate / 1024).toFixed(1)} KB/s, ~${((bytes.length - off) / rate).toFixed(0)} s left`, 'sys');
+        nextPct = pct + 2;
       }
+      /* macrotask yield between frames so the page can paint progress */
+      await new Promise(res => setTimeout(res, 0));
     }
     log(`upload done in ${((Date.now() - t0) / 1000).toFixed(0)} s — marking for test boot`, 'sys');
     const imgs = await fwReadSlots(true);
     const spare = imgs.find(im => im.slot === 1);
     if (!spare) throw new Error('no image in spare slot after upload');
+    /* Same image as the running one: the device finds the hash in the ACTIVE
+     * slot first and refuses to "test" the active slot (legacy rc=1). Say so
+     * plainly instead of reporting a failure (2026-10-08). */
+    const active = imgs.find(im => im.active);
+    if (active && hex(active.hash || []) === hex(spare.hash || [])) {
+      log(`this image (v${spare.version}) is already running on the device — nothing to install`, 'sys');
+      return;
+    }
     await smpRequest(2, 1, 0, { hash: spare.hash, confirm: false }, 8000);
     log('rebooting into new firmware (trial) — this page will reconnect automatically', 'sys');
     dfuAwaitingConfirm = true;
     await smpRequest(2, 0, 5, {}, 8000).catch(() => {});   /* os reset; link drops */
   } catch (e) { log(`firmware update failed: ${e.message}`, 'err'); }
-  $('fwProg').hidden = true;
-  $('btnFw').disabled = false;
+  finally {
+    $('fwProg').hidden = true;
+    $('btnFw').disabled = false;
+  }
 }
 
 async function fwConfirm() {
